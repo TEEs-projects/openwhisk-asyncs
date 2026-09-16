@@ -34,7 +34,13 @@ import org.apache.openwhisk.core.entity.size._
 import org.apache.openwhisk.core.etcd.EtcdKV.{InvokerKeys, QueueKeys, SchedulerKeys, ThrottlingKeys}
 import org.apache.openwhisk.core.etcd.EtcdType._
 import org.apache.openwhisk.core.etcd.{EtcdClient, EtcdConfig}
-import org.apache.openwhisk.core.scheduler.queue.{CreateQueue, CreateQueueResponse, QueueManager}
+import org.apache.openwhisk.core.scheduler.queue.{
+  CreateQueue,
+  CreateQueueResponse,
+  GatewayControlConfig,
+  P1GatewayControlClient,
+  QueueManager
+}
 import org.apache.openwhisk.core.scheduler.{SchedulerEndpoints, SchedulerStates}
 import org.apache.openwhisk.core.service._
 import org.apache.openwhisk.core.{ConfigKeys, WarmUp, WhiskConfig}
@@ -58,7 +64,8 @@ class FPCPoolBalancer(config: WhiskConfig,
                       private val feedFactory: FeedFactory,
                       lbConfig: ShardingContainerPoolBalancerConfig =
                         loadConfigOrThrow[ShardingContainerPoolBalancerConfig](ConfigKeys.loadbalancer),
-                      private val messagingProvider: MessagingProvider = SpiLoader.get[MessagingProvider])(
+                      private val messagingProvider: MessagingProvider = SpiLoader.get[MessagingProvider],
+                      providedGatewayResultFinalizer: Option[GatewayResultFinalizer] = None)(
   implicit val actorSystem: ActorSystem,
   logging: Logging)
     extends LoadBalancer {
@@ -68,6 +75,35 @@ class FPCPoolBalancer(config: WhiskConfig,
   private implicit val requestTimeout: Timeout = Timeout(8.seconds)
 
   private val entityStore = WhiskEntityStore.datastore()
+
+  private val gatewayResultFinalizer: GatewayResultFinalizer = providedGatewayResultFinalizer.getOrElse {
+    val enabled = sys.env
+      .get("REUSABLE_CONCURRENCY_RESULT_FINALIZATION_ENABLED")
+      .exists(value => Set("1", "true", "yes").contains(value.trim.toLowerCase))
+    if (!enabled) {
+      GatewayResultFinalizer.Unconfigured
+    } else {
+      def required(name: String): String =
+        sys.env.get(name).map(_.trim).filter(_.nonEmpty).getOrElse {
+          throw new IllegalArgumentException(s"$name is required for reusable-concurrency result finalization")
+        }
+      def positiveInt(name: String, default: Int): Int = {
+        val value = sys.env.get(name).map(_.trim).filter(_.nonEmpty).map(_.toInt).getOrElse(default)
+        require(value > 0, s"$name must be positive")
+        value
+      }
+      val gatewayConfig = GatewayControlConfig(
+        enabled = true,
+        host = required("REUSABLE_GATEWAY_CONTROL_HOST"),
+        port = positiveInt("REUSABLE_GATEWAY_CONTROL_PORT", 0),
+        connectTimeout = positiveInt("REUSABLE_GATEWAY_CONNECT_TIMEOUT_MS", 3000).millis,
+        readTimeout = positiveInt("REUSABLE_GATEWAY_READ_TIMEOUT_MS", 30000).millis,
+        maxEnvelopeBytes = positiveInt("REUSABLE_GATEWAY_MAX_ENVELOPE_BYTES", 16777216))
+      val gatewayExecutionContext = actorSystem.dispatchers.lookup("dispatchers.gateway-control-dispatcher")
+      val gatewayClient = new P1GatewayControlClient(gatewayConfig)(gatewayExecutionContext)
+      new P1GatewayResultFinalizer(gatewayClient)(executionContext, logging)
+    }
+  }
 
   private val clusterName = loadConfigOrThrow[String](ConfigKeys.whiskClusterName)
 
@@ -293,30 +329,41 @@ class FPCPoolBalancer(config: WhiskConfig,
     feedFactory.createFeed(actorSystem, messagingProvider, processAcknowledgement)
 
   /** 4. Get the active-ack message and parse it */
-  protected[loadBalancer] def processAcknowledgement(bytes: Array[Byte]): Future[Unit] = Future {
+  protected[loadBalancer] def processAcknowledgement(bytes: Array[Byte]): Future[Unit] = {
     val raw = new String(bytes, StandardCharsets.UTF_8)
     AcknowledgementMessage.parse(raw) match {
       case Success(acknowledgement) =>
-        acknowledgement.isSlotFree.foreach { invoker =>
-          processCompletion(
-            acknowledgement.activationId,
-            acknowledgement.transid,
-            forced = false,
-            isSystemError = acknowledgement.isSystemError.getOrElse(false))
+        val acknowledgedSystemError = acknowledgement.isSystemError.getOrElse(false)
+        val finalized: Future[(Option[Either[ActivationId, WhiskActivation]], Boolean)] = acknowledgement.result match {
+          case Some(Right(activation)) =>
+            gatewayResultFinalizer.finalizeResult(activation).map {
+              case Right(value) => Some(Right(value)) -> (acknowledgedSystemError || value.response.isWhiskError)
+              case Left(reason) => Some(Right(GatewayResultFinalizer.systemError(activation, reason))) -> true
+            }
+          case result => Future.successful(result -> acknowledgedSystemError)
         }
 
-        acknowledgement.result.foreach { response =>
-          processResult(acknowledgement.activationId, acknowledgement.transid, response)
+        finalized.map {
+          case (response, finalSystemError) =>
+            response.foreach(processResult(acknowledgement.activationId, acknowledgement.transid, _))
+            acknowledgement.isSlotFree.foreach { _ =>
+              processCompletion(
+                acknowledgement.activationId,
+                acknowledgement.transid,
+                forced = false,
+                isSystemError = finalSystemError)
+            }
+            activationFeed ! MessageFeed.Processed
         }
-
-        activationFeed ! MessageFeed.Processed
       case Failure(t) =>
         activationFeed ! MessageFeed.Processed
         logging.error(this, s"failed processing message: $raw")
+        Future.successful(())
 
       case _ =>
         activationFeed ! MessageFeed.Processed
         logging.warn(this, s"Unexpected Acknowledgement message received by loadbalancer: $raw")
+        Future.successful(())
     }
   }
 

@@ -113,7 +113,16 @@ trait Container {
   def initialize(initializer: JsObject,
                  timeout: FiniteDuration,
                  maxConcurrent: Int,
-                 entity: Option[WhiskAction] = None)(implicit transid: TransactionId): Future[Interval] = {
+                 entity: Option[WhiskAction] = None)(implicit transid: TransactionId): Future[Interval] =
+    initializeAtPath("/init", initializer, timeout, maxConcurrent)
+
+  /** Initializes target-protected code through the Reusable executor contract. */
+  def initializeTargetBound(initializer: JsObject, timeout: FiniteDuration, maxConcurrent: Int)(
+    implicit transid: TransactionId): Future[Interval] =
+    initializeAtPath(s"/${id.asString}/init", initializer, timeout, maxConcurrent)
+
+  private def initializeAtPath(path: String, initializer: JsObject, timeout: FiniteDuration, maxConcurrent: Int)(
+    implicit transid: TransactionId): Future[Interval] = {
     val start = transid.started(
       this,
       LoggingMarkers.INVOKER_ACTIVATION_INIT,
@@ -123,7 +132,7 @@ trait Container {
     containerHttpTimeout = timeout
     val body = JsObject("value" -> initializer)
     callContainer(
-      "/init",
+      path,
       body,
       timeout,
       maxConcurrent,
@@ -165,6 +174,23 @@ trait Container {
       }
   }
 
+  /** Installs an ACTIVE Gateway binding in the concrete Reusable executor. */
+  def activateTargetBinding(targetBindingId: Long, timeout: FiniteDuration)(
+    implicit transid: TransactionId): Future[Unit] = {
+    require(targetBindingId > 0, "target binding id must be positive")
+    callContainer(
+      s"/${id.asString}/target",
+      JsObject("target_binding_id" -> spray.json.JsNumber(targetBindingId)),
+      timeout,
+      maxConcurrent = 1,
+      ActivationEntityLimit.MAX_ACTIVATION_ENTITY_LIMIT,
+      ActivationEntityLimit.MAX_ACTIVATION_ENTITY_TRUNCATION_LIMIT,
+      retry = true).flatMap { result =>
+      if (result.ok) Future.successful(())
+      else Future.failed(new IllegalStateException(s"target binding activation failed for $id"))
+    }
+  }
+
   /** Runs code in the container. Thread-safe - caller may invoke concurrently for concurrent activation processing. */
   def run(parameters: JsValue,
           environment: JsObject,
@@ -172,7 +198,37 @@ trait Container {
           maxConcurrent: Int,
           maxResponse: ByteSize,
           truncation: ByteSize,
-          reschedule: Boolean = false)(implicit transid: TransactionId): Future[(Interval, ActivationResponse)] = {
+          reschedule: Boolean = false)(implicit transid: TransactionId): Future[(Interval, ActivationResponse)] =
+    runAtPath("/run", parameters, environment, timeout, maxConcurrent, maxResponse, truncation, reschedule)
+
+  /** Runs one target-protected invocation through the Reusable executor contract. */
+  def runTargetBound(
+    parameters: JsValue,
+    environment: JsObject,
+    timeout: FiniteDuration,
+    maxConcurrent: Int,
+    maxResponse: ByteSize,
+    truncation: ByteSize,
+    reschedule: Boolean = false)(implicit transid: TransactionId): Future[(Interval, ActivationResponse)] =
+    runAtPath(
+      s"/${id.asString}/run",
+      parameters,
+      environment,
+      timeout,
+      maxConcurrent,
+      maxResponse,
+      truncation,
+      reschedule)
+
+  private def runAtPath(
+    path: String,
+    parameters: JsValue,
+    environment: JsObject,
+    timeout: FiniteDuration,
+    maxConcurrent: Int,
+    maxResponse: ByteSize,
+    truncation: ByteSize,
+    reschedule: Boolean)(implicit transid: TransactionId): Future[(Interval, ActivationResponse)] = {
     val actionName = environment.fields.get("action_name").map(_.convertTo[String]).getOrElse("")
     val start =
       transid.started(
@@ -183,7 +239,7 @@ trait Container {
 
     val parameterWrapper = JsObject("value" -> parameters)
     val body = JsObject(parameterWrapper.fields ++ environment.fields)
-    callContainer("/run", body, timeout, maxConcurrent, maxResponse, truncation, retry = false, reschedule)
+    callContainer(path, body, timeout, maxConcurrent, maxResponse, truncation, retry = false, reschedule)
       .andThen { // never fails
         case Success(r: RunResult) =>
           transid.finished(

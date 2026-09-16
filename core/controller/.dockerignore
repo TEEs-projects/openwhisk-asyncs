@@ -1,4 +1,6 @@
 *
 !init.sh
+!docker-*.tgz
+!swagger-ui-v*.tar.gz
 !build/distributions
 !build/tmp/docker-coverage

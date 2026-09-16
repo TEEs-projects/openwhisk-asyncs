@@ -30,6 +30,39 @@ import org.apache.openwhisk.core.controller.WhiskServices
 import org.apache.openwhisk.core.entity._
 import org.apache.openwhisk.http.Messages
 
+protected[controller] case class BackendPressureMetadata(runId: String,
+                                                         logicalRequestId: String,
+                                                         profile: String,
+                                                         concurrency: Int,
+                                                         requestGenerationMode: String = "",
+                                                         targetArrivalRatePerSec: Double = 0.0,
+                                                         durationSec: Int = 0,
+                                                         plannedLogicalRequests: Int = 0,
+                                                         rampStageIndex: Option[Int] = None,
+                                                         rampStageRatePerSec: Option[Double] = None,
+                                                         rampStageStartOffsetNs: Option[Long] = None,
+                                                         rampStageEndOffsetNs: Option[Long] = None,
+                                                         plannedSubmitOffsetNs: Option[Long] = None,
+                                                         plannedSubmitMonoNs: Long = 0L,
+                                                         actualSubmitMonoNs: Long = 0L,
+                                                         sourceScheduleLagNs: Long = 0L,
+                                                         attemptId: Int = 1)
+
+protected[controller] case class BackendPressureActivationResult(activationId: ActivationId,
+                                                                 status: String,
+                                                                 reason: String,
+                                                                 attemptId: Int = 1) {
+  def completed: Boolean = status == BackendPressureActivationResult.Completed
+  def failed: Boolean = status == BackendPressureActivationResult.Failed
+  def notReady: Boolean = status == BackendPressureActivationResult.NotReady
+}
+
+protected[controller] object BackendPressureActivationResult {
+  val Completed = "completed"
+  val Failed = "failed"
+  val NotReady = "not_ready"
+}
+
 protected[core] trait PostActionActivation extends PrimitiveActions with SequenceActions {
   /** The core collections require backend services to be injected in this trait. */
   services: WhiskServices =>

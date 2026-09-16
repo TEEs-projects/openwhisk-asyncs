@@ -39,6 +39,7 @@ import org.apache.openwhisk.core.etcd.EtcdKV.{ContainerKeys, SchedulerKeys}
 import org.apache.openwhisk.core.etcd.EtcdType._
 import org.apache.openwhisk.core.etcd.{EtcdClient, EtcdConfig, EtcdWorker}
 import org.apache.openwhisk.core.invoker.Invoker.InvokerEnabled
+import org.apache.openwhisk.core.scheduler.queue.{GatewayControlConfig, P1GatewayControlClient}
 import org.apache.openwhisk.core.scheduler.{SchedulerEndpoints, SchedulerStates}
 import org.apache.openwhisk.core.service.{DataManagementService, LeaseKeepAliveService, WatcherService}
 import org.apache.openwhisk.core.{ConfigKeys, WarmUp, WhiskConfig}
@@ -85,6 +86,50 @@ class FPCInvokerReactive(config: WhiskConfig,
   private val etcdClient = EtcdClient(loadConfigOrThrow[EtcdConfig](ConfigKeys.etcd))
 
   private val grpcConfig = loadConfigOrThrow[GrpcServiceConfig](ConfigKeys.schedulerGrpcService)
+
+  private val targetBindingProvider: TargetBindingProvider = {
+    val enabled = sys.env
+      .get("REUSABLE_CONCURRENCY_TARGET_BINDING_ENABLED")
+      .exists(value => Set("1", "true", "yes").contains(value.trim.toLowerCase))
+    if (!enabled) {
+      TargetBindingProvider.Disabled
+    } else {
+      def required(name: String): String =
+        sys.env.get(name).map(_.trim).filter(_.nonEmpty).getOrElse {
+          throw new IllegalArgumentException(s"$name is required for reusable-concurrency target binding")
+        }
+      def positiveInt(name: String, default: Option[Int] = None): Int = {
+        val value = sys.env.get(name).map(_.trim).filter(_.nonEmpty).map(_.toInt).orElse(default).getOrElse {
+          throw new IllegalArgumentException(s"$name is required for reusable-concurrency target binding")
+        }
+        require(value > 0, s"$name must be positive")
+        value
+      }
+
+      val targetBridgeControlHost = required(TargetBindingProvider.BridgeControlHostEnv)
+      val gatewayConfig = GatewayControlConfig(
+        enabled = true,
+        host = required("REUSABLE_GATEWAY_CONTROL_HOST"),
+        port = positiveInt("REUSABLE_GATEWAY_CONTROL_PORT"),
+        connectTimeout = positiveInt("REUSABLE_GATEWAY_CONNECT_TIMEOUT_MS", Some(3000)).millis,
+        readTimeout = positiveInt("REUSABLE_GATEWAY_READ_TIMEOUT_MS", Some(30000)).millis,
+        maxEnvelopeBytes = positiveInt("REUSABLE_GATEWAY_MAX_ENVELOPE_BYTES", Some(16777216)))
+      val gatewayExecutionContext = actorSystem.dispatchers.lookup("dispatchers.gateway-control-dispatcher")
+      val gatewayClient = new P1GatewayControlClient(gatewayConfig)(gatewayExecutionContext)
+      val bridgeClient = new HttpTargetEndpointBridgeClient(
+        targetBridgeControlHost,
+        positiveInt(TargetBindingProvider.BridgeControlPortEnv),
+        gatewayConfig.connectTimeout,
+        gatewayConfig.readTimeout)(gatewayExecutionContext)
+      val targetDhPort = positiveInt("REUSABLE_TARGET_DH_PORT")
+      new GatewayTargetBindingProvider(
+        gatewayClient,
+        bridgeClient,
+        targetDhPort,
+        positiveInt("REUSABLE_TARGET_READY_TIMEOUT_MS", Some(60000)).millis,
+        positiveInt("REUSABLE_TARGET_READY_RETRY_INTERVAL_MS", Some(250)).millis)(actorSystem, ec)
+    }
+  }
 
   val watcherService: ActorRef = actorSystem.actorOf(WatcherService.props(etcdClient))
 
@@ -187,7 +232,8 @@ class FPCInvokerReactive(config: WhiskConfig,
                                             rev: DocRevision,
                                             schedulerHost: String,
                                             rpcPort: Int,
-                                            containerId: ContainerId): ActorRef =
+                                            containerId: ContainerId,
+                                            targetBindingId: Option[Long]): ActorRef =
     f.actorOf(Props(HealthActivationServiceClient()))
 
   private def healthContainerProxyFactory(f: ActorRefFactory, healthManger: ActorRef): ActorRef = {
@@ -312,7 +358,8 @@ class FPCInvokerReactive(config: WhiskConfig,
           instance,
           invokerHealthManager,
           poolConfig,
-          containerProxyTimeoutConfig))
+          containerProxyTimeoutConfig,
+          targetBindingProvider = targetBindingProvider))
   }
 
   /** Creates a ActivationClientProxy Actor when being called. */
@@ -322,11 +369,20 @@ class FPCInvokerReactive(config: WhiskConfig,
                                  rev: DocRevision,
                                  schedulerHost: String,
                                  rpcPort: Int,
-                                 containerId: ContainerId): ActorRef = {
+                                 containerId: ContainerId,
+                                 targetBindingId: Option[Long]): ActorRef = {
     implicit val transId = TransactionId.invokerNanny
     f.actorOf(
       ActivationClientProxy
-        .props(invocationNamespace, fqn, rev, schedulerHost, rpcPort, containerId, activationClientFactory(etcdClient)))
+        .props(
+          invocationNamespace,
+          fqn,
+          rev,
+          schedulerHost,
+          rpcPort,
+          containerId,
+          activationClientFactory(etcdClient),
+          targetBindingId))
   }
 
   val prewarmingConfigs: List[PrewarmingConfig] = {

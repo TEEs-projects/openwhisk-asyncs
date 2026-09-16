@@ -62,7 +62,7 @@ import spray.json.{JsObject, JsString}
 
 import scala.collection.immutable.Queue
 import scala.collection.mutable
-import scala.concurrent.Future
+import scala.concurrent.{Future, Promise}
 import scala.concurrent.duration._
 import scala.language.{higherKinds, postfixOps}
 
@@ -752,6 +752,113 @@ class MemoryQueueTests
       .mapTo[GetActivationResponse]
       .futureValue shouldBe GetActivationResponse(Right(message))
 
+    fsm.stop()
+  }
+
+  it should "preserve target binding ids through queued and waiting pull paths" in {
+    implicit val clock = SystemClock
+    val mockEtcdClient = mock[EtcdClient]
+    val probe = TestProbe()
+    val tid = TransactionId(TransactionId.generateTid())
+    val seenBindings = mutable.ArrayBuffer.empty[Option[Long]]
+    val waitingDispatch = Promise[Either[TargetReencryptionError, ActivationMessage]]()
+    val dispatcher = new TargetBoundActivationDispatcher {
+      override def prepare(request: GetActivation, activation: ActivationMessage) = {
+        seenBindings.synchronized(seenBindings += request.targetBindingId)
+        if (request.targetBindingId.contains(42L)) waitingDispatch.future
+        else Future.successful(Right(activation))
+      }
+    }
+
+    expectDurationChecking(mockEsClient, testInvocationNamespace)
+    val fsm = TestFSMRef(
+      new MemoryQueue(
+        mockEtcdClient,
+        durationChecker,
+        fqn,
+        mockMessaging(),
+        schedulingConfig,
+        testInvocationNamespace,
+        revision,
+        endpoints,
+        actionMetadata,
+        probe.ref,
+        probe.ref,
+        probe.ref,
+        TestProbe().ref,
+        schedulerId,
+        ack,
+        store,
+        getUserLimit,
+        checkToDropStaleActivation,
+        queueConfig,
+        dispatcher))
+    fsm.setState(Running, RunningData(probe.ref, probe.ref))
+
+    fsm ! message
+    (fsm ? GetActivation(tid, fqn, testContainerId, warmed = false, None, targetBindingId = Some(41L)))
+      .mapTo[GetActivationResponse]
+      .futureValue shouldBe GetActivationResponse(Right(message))
+
+    val waiting = TestProbe()
+    val waitingMessage = message.copy(activationId = ActivationId.generate())
+    fsm.tell(GetActivation(tid, fqn, testContainerId, warmed = true, None, targetBindingId = Some(42L)), waiting.ref)
+    fsm ! waitingMessage
+    waiting.expectNoMessage(1500.milliseconds)
+    waitingDispatch.success(Right(waitingMessage))
+    waiting.expectMsg(GetActivationResponse(Right(waitingMessage)))
+
+    awaitAssert(seenBindings.synchronized(seenBindings.toList) shouldBe List(Some(41L), Some(42L)))
+    fsm.stop()
+  }
+
+  it should "return an explicit target dispatch error and requeue the original activation" in {
+    implicit val clock = SystemClock
+    val mockEtcdClient = mock[EtcdClient]
+    val probe = TestProbe()
+    val tid = TransactionId(TransactionId.generateTid())
+    @volatile var reject = true
+    val dispatcher = new TargetBoundActivationDispatcher {
+      override def prepare(request: GetActivation, activation: ActivationMessage) =
+        Future.successful {
+          if (reject) Left(TargetReencryptionError("intentional target dispatch failure")) else Right(activation)
+        }
+    }
+
+    expectDurationChecking(mockEsClient, testInvocationNamespace)
+    val fsm = TestFSMRef(
+      new MemoryQueue(
+        mockEtcdClient,
+        durationChecker,
+        fqn,
+        mockMessaging(),
+        schedulingConfig,
+        testInvocationNamespace,
+        revision,
+        endpoints,
+        actionMetadata,
+        probe.ref,
+        probe.ref,
+        probe.ref,
+        TestProbe().ref,
+        schedulerId,
+        ack,
+        store,
+        getUserLimit,
+        checkToDropStaleActivation,
+        queueConfig,
+        dispatcher))
+    fsm.setState(Running, RunningData(probe.ref, probe.ref))
+    fsm ! message
+
+    (fsm ? GetActivation(tid, fqn, testContainerId, warmed = false, None, targetBindingId = Some(41L)))
+      .mapTo[GetActivationResponse]
+      .futureValue shouldBe GetActivationResponse(Left(TargetReencryptionError("intentional target dispatch failure")))
+
+    reject = false
+    (fsm ? GetActivation(tid, fqn, testContainerId, warmed = false, None, targetBindingId = Some(41L)))
+      .mapTo[GetActivationResponse]
+      .futureValue shouldBe GetActivationResponse(Right(message))
     fsm.stop()
   }
 

@@ -28,10 +28,18 @@ import org.apache.openwhisk.core.containerpool.ContainerId
 import org.apache.openwhisk.core.entity._
 import org.apache.openwhisk.core.scheduler.SchedulerEndpoints
 import org.apache.openwhisk.core.scheduler.grpc.ActivationResponse
-import org.apache.openwhisk.core.scheduler.queue.{ActionMismatch, MemoryQueueError, NoActivationMessage, NoMemoryQueue}
+import org.apache.openwhisk.core.scheduler.queue.{
+  ActionMismatch,
+  MemoryQueueError,
+  NoActivationMessage,
+  NoMemoryQueue,
+  TargetBindingError,
+  TargetReencryptionError
+}
 import org.apache.openwhisk.grpc.{ActivationServiceClient, FetchRequest, RescheduleRequest, RescheduleResponse}
 import spray.json.JsonParser.ParsingException
 
+import java.lang.management.ManagementFactory
 import scala.concurrent.Future
 import scala.util.{Success, Try}
 
@@ -70,15 +78,38 @@ class ActivationClientProxy(
   schedulerHost: String,
   rpcPort: Int,
   containerId: ContainerId,
-  activationClientFactory: (String, FullyQualifiedEntityName, String, Int, Boolean) => Future[ActivationServiceClient])(
-  implicit actorSystem: ActorSystem,
-  logging: Logging)
+  activationClientFactory: (String, FullyQualifiedEntityName, String, Int, Boolean) => Future[ActivationServiceClient],
+  targetBindingId: Option[Long] = None)(implicit actorSystem: ActorSystem, logging: Logging)
     extends FSM[ActivationClientProxyState, ActivationClientProxyData]
     with Stash {
 
   implicit val ec = actorSystem.dispatcher
 
   private var warmed = false
+  private val c1TimingProcessId = ManagementFactory.getRuntimeMXBean.getName.takeWhile(_ != '@')
+  private val c1TimingNode = sys.env.get("C1_TIMING_NODE_ID").orElse(sys.env.get("HOSTNAME")).getOrElse("")
+
+  private def c1TimingSanitize(value: String): String =
+    value.replace('|', '_').replace('\n', ' ').replace('\r', ' ')
+
+  private def c1TimingField(key: String, value: String): String = s"$key=${c1TimingSanitize(value)}"
+
+  private def emitC1TimingEvent(eventCode: String, boundaryName: String, msg: ActivationMessage): Unit = {
+    val unixNs = System.currentTimeMillis() * 1000000L
+    val monoNs = System.nanoTime()
+    val fields = Seq(
+      c1TimingField("event_code", eventCode),
+      c1TimingField("activation_id", msg.activationId.asString),
+      c1TimingField("boundary_name", boundaryName),
+      c1TimingField("node", c1TimingNode),
+      c1TimingField("process", "openwhisk_invoker"),
+      c1TimingField("pid", c1TimingProcessId),
+      c1TimingField("tid", msg.transid.id),
+      c1TimingField("unix_ns", unixNs.toString),
+      c1TimingField("mono_ns", monoNs.toString),
+      c1TimingField("clock_domain", "openwhisk_invoker_jvm_mono"))
+    logging.info(this, s"C1TIMING_EVENT|${fields.mkString("|")}")(msg.transid)
+  }
 
   startWith(ClientProxyUninitialized, Retry(3))
 
@@ -181,6 +212,13 @@ class ActivationClientProxy(
           context.parent ! RetryRequestActivation
 
           stay()
+
+        case e @ (_: TargetBindingError | _: TargetReencryptionError) =>
+          val errorMsg = s"[${containerId.asString}] target-bound activation fetch failed: ${e.causedBy}"
+          logging.error(this, errorMsg)
+          context.parent ! FailureMessage(new RuntimeException(errorMsg))
+          safelyCloseClient(c)
+          goto(ClientProxyRemoving)
       }
 
     /**
@@ -322,16 +360,16 @@ class ActivationClientProxy(
   private def safelyCloseClient(client: Client): Unit = {
     Try {
       client.activationClient
-        .fetchActivation(
-          FetchRequest(
-            TransactionId(TransactionId.generateTid()).serialize,
-            invocationNamespace,
-            action.serialize,
-            rev.serialize,
-            containerId.asString,
-            warmed,
-            None,
-            false))
+        .fetchActivation(FetchRequest(
+          TransactionId(TransactionId.generateTid()).serialize,
+          invocationNamespace,
+          action.serialize,
+          rev.serialize,
+          containerId.asString,
+          warmed,
+          None,
+          false,
+          targetBindingId))
         .andThen {
           case _ =>
             client.activationClient.close().andThen {
@@ -357,21 +395,23 @@ class ActivationClientProxy(
                                        lastDuration: Option[Long] = None) = {
     Try {
       client
-        .fetchActivation(
-          FetchRequest(
-            TransactionId(TransactionId.generateTid()).serialize,
-            invocationNamespace,
-            fqn.serialize,
-            rev.serialize,
-            containerId.asString,
-            warmed,
-            lastDuration,
-            true))
+        .fetchActivation(FetchRequest(
+          TransactionId(TransactionId.generateTid()).serialize,
+          invocationNamespace,
+          fqn.serialize,
+          rev.serialize,
+          containerId.asString,
+          warmed,
+          lastDuration,
+          true,
+          targetBindingId))
         .flatMap { r =>
           Future(ActivationResponse.parse(r.activationMessage))
             .flatMap(Future.fromTry)
             .flatMap {
               case ActivationResponse(Right(msg)) =>
+                emitC1TimingEvent("OW310", "openwhisk_worker_activation_received", msg)
+                emitC1TimingEvent("N300", "native_worker_activation_fetch_received", msg)
                 Future.successful(msg)
               case ActivationResponse(Left(msg)) =>
                 Future.successful(msg)
@@ -419,12 +459,12 @@ object ActivationClientProxy {
             schedulerHost: String,
             rpcPort: Int,
             containerId: ContainerId,
-            activationClientFactory: (
-              String,
-              FullyQualifiedEntityName,
-              String,
-              Int,
-              Boolean) => Future[ActivationServiceClient])(implicit actorSystem: ActorSystem, logging: Logging) = {
+            activationClientFactory: (String,
+                                      FullyQualifiedEntityName,
+                                      String,
+                                      Int,
+                                      Boolean) => Future[ActivationServiceClient],
+            targetBindingId: Option[Long] = None)(implicit actorSystem: ActorSystem, logging: Logging) = {
     Props(
       new ActivationClientProxy(
         invocationNamespace,
@@ -433,7 +473,8 @@ object ActivationClientProxy {
         schedulerHost,
         rpcPort,
         containerId,
-        activationClientFactory))
+        activationClientFactory,
+        targetBindingId))
   }
 }
 

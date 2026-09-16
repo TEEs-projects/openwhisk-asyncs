@@ -199,13 +199,25 @@ class FunctionPullingContainerProxyTests
   }
 
   /** Creates a client and a factory returning this ref of the client. */
-  def testClient
-    : (TestProbe,
-       (ActorRefFactory, String, FullyQualifiedEntityName, DocRevision, String, Int, ContainerId) => ActorRef) = {
+  def testClient: (TestProbe,
+                   (ActorRefFactory,
+                    String,
+                    FullyQualifiedEntityName,
+                    DocRevision,
+                    String,
+                    Int,
+                    ContainerId,
+                    Option[Long]) => ActorRef) = {
     val client = TestProbe()
     val factory =
-      (_: ActorRefFactory, _: String, _: FullyQualifiedEntityName, _: DocRevision, _: String, _: Int, _: ContainerId) =>
-        client.ref
+      (_: ActorRefFactory,
+       _: String,
+       _: FullyQualifiedEntityName,
+       _: DocRevision,
+       _: String,
+       _: Int,
+       _: ContainerId,
+       _: Option[Long]) => client.ref
     (client, factory)
   }
 
@@ -411,6 +423,47 @@ class FunctionPullingContainerProxyTests
     memory shouldBe memoryLimit
   }
 
+  it should "destroy a concrete container when target binding readiness fails" in within(timeout) {
+    val authStore = mock[ArtifactWhiskAuthStore]
+    val namespaceBlacklist: NamespaceBlacklist = new NamespaceBlacklist(authStore)
+    val container = new TestContainer
+    val provider = new TargetBindingProvider {
+      override def requiresBinding(kind: String): Boolean = true
+      override def awaitReady(target: TargetContainer): Future[TargetBinding] =
+        Future.failed(new RuntimeException("intentional binding failure"))
+      override def closeBinding(target: TargetContainer, binding: TargetBinding): Future[Unit] =
+        Future.successful(())
+    }
+    val probe = TestProbe()
+    val (_, clientFactory) = testClient
+    val machine = probe.childActorOf(
+      FunctionPullingContainerProxy.props(
+        createFactory(Future.successful(container)),
+        entityStore,
+        namespaceBlacklist,
+        getWhiskAction(Future(action.toWhiskAction)),
+        TestProbe().ref,
+        clientFactory,
+        createAcker(),
+        createStore,
+        createCollector(),
+        getLiveContainerCount(1),
+        getWarmedContainerLimit(Future.successful((1, 10.seconds))),
+        InvokerInstanceId(0, userMemory = defaultUserMemory),
+        invokerHealthManager.ref,
+        poolConfig,
+        timeoutConfig,
+        targetBindingProvider = provider))
+
+    registerCallback(machine, probe)
+    probe.watch(machine)
+    machine ! Start(exec, memoryLimit)
+    probe.expectMsg(Transition(machine, Uninitialized, CreatingContainer))
+    probe.expectMsg(ContainerRemoved(true))
+    probe.expectTerminated(machine)
+    container.destroyCount shouldBe 1
+  }
+
   it should "run actions to a started prewarm container with get activationMessage successfully" in within(timeout) {
     implicit val transid: TransactionId = messageTransId
     val authStore = mock[ArtifactWhiskAuthStore]
@@ -611,6 +664,70 @@ class FunctionPullingContainerProxyTests
     }
   }
 
+  it should "wait for an ACTIVE target binding before the first pull and close it before destroy" in within(timeout) {
+    val authStore = mock[ArtifactWhiskAuthStore]
+    val namespaceBlacklist: NamespaceBlacklist = new NamespaceBlacklist(authStore)
+    val container = new TestContainer
+    val bindingPromise = Promise[TargetBinding]()
+    @volatile var closedBinding = Option.empty[(TargetContainer, TargetBinding)]
+    val provider = new TargetBindingProvider {
+      override def requiresBinding(kind: String): Boolean = kind == action.exec.kind
+      override def awaitReady(target: TargetContainer): Future[TargetBinding] = bindingPromise.future
+      override def closeBinding(target: TargetContainer, binding: TargetBinding): Future[Unit] = {
+        closedBinding = Some(target -> binding)
+        Future.successful(())
+      }
+    }
+    val client = TestProbe()
+    @volatile var clientBindingId = Option.empty[Long]
+    val clientFactory = (_: ActorRefFactory,
+                         _: String,
+                         _: FullyQualifiedEntityName,
+                         _: DocRevision,
+                         _: String,
+                         _: Int,
+                         _: ContainerId,
+                         bindingId: Option[Long]) => {
+      clientBindingId = bindingId
+      client.ref
+    }
+    val probe = TestProbe()
+    val machine = probe.childActorOf(
+      FunctionPullingContainerProxy.props(
+        createFactory(Future.successful(container)),
+        entityStore,
+        namespaceBlacklist,
+        getWhiskAction(Future(action.toWhiskAction)),
+        TestProbe().ref,
+        clientFactory,
+        createAcker(),
+        createStore,
+        createCollector(),
+        getLiveContainerCount(1),
+        getWarmedContainerLimit(Future.successful((1, 10.seconds))),
+        InvokerInstanceId(0, userMemory = defaultUserMemory),
+        invokerHealthManager.ref,
+        poolConfig,
+        timeoutConfig,
+        targetBindingProvider = provider))
+
+    registerCallback(machine, probe)
+    machine ! Initialize(invocationNamespace.asString, fqn, action, schedulerHost, rpcPort, messageTransId)
+    probe.expectMsg(Transition(machine, Uninitialized, CreatingClient))
+    client.expectNoMessage(200.milliseconds)
+
+    bindingPromise.success(TargetBinding(41L))
+    client.expectMsg(StartClient)
+    clientBindingId shouldBe Some(41L)
+
+    probe.watch(machine)
+    machine ! ClientClosed
+    probe.expectMsgAllOf(ContainerRemoved(true), Transition(machine, CreatingClient, Removing))
+    probe.expectTerminated(machine)
+    closedBinding.map(_._2.id) shouldBe Some(41L)
+    container.destroyCount shouldBe 1
+  }
+
   it should "run actions to a cold start container with get no activationMessage" in within(timeout) {
     val authStore = mock[ArtifactWhiskAuthStore]
     val namespaceBlacklist: NamespaceBlacklist = new NamespaceBlacklist(authStore)
@@ -694,7 +811,8 @@ class FunctionPullingContainerProxyTests
                       d: DocRevision,
                       schedulerHost: String,
                       rpcPort: Int,
-                      c: ContainerId): ActorRef = {
+                      c: ContainerId,
+                      targetBindingId: Option[Long]): ActorRef = {
       throw new Exception("failed to create activation client")
     }
 
@@ -755,7 +873,8 @@ class FunctionPullingContainerProxyTests
                       d: DocRevision,
                       schedulerHost: String,
                       rpcPort: Int,
-                      c: ContainerId): ActorRef = {
+                      c: ContainerId,
+                      targetBindingId: Option[Long]): ActorRef = {
       throw new Exception("failed to create activation client")
     }
 

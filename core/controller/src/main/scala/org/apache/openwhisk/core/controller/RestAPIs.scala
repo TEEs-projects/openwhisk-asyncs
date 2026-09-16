@@ -198,7 +198,8 @@ class RestAPIVersion(config: WhiskConfig, apiPath: String, apiVersion: String)(
       sendCorsHeaders {
         info ~
           authenticationDirectiveProvider.authenticate(transid, authStore, logging) { user =>
-            namespaces.routes(user) ~
+            actions.backendPressureRoutes(user) ~
+              namespaces.routes(user) ~
               pathPrefix(Collection.NAMESPACES) {
                 actions.routes(user) ~
                   triggers.routes(user) ~

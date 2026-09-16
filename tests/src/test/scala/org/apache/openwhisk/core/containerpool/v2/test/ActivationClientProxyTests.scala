@@ -33,7 +33,12 @@ import org.apache.openwhisk.core.entity.ExecManifest.{ImageName, RuntimeManifest
 import org.apache.openwhisk.core.entity._
 import org.apache.openwhisk.core.scheduler.SchedulerEndpoints
 import org.apache.openwhisk.core.scheduler.grpc.{ActivationResponse => AResponse}
-import org.apache.openwhisk.core.scheduler.queue.{ActionMismatch, NoActivationMessage, NoMemoryQueue}
+import org.apache.openwhisk.core.scheduler.queue.{
+  ActionMismatch,
+  NoActivationMessage,
+  NoMemoryQueue,
+  TargetReencryptionError
+}
 import org.apache.openwhisk.grpc
 import org.apache.openwhisk.grpc.{ActivationServiceClient, FetchRequest, RescheduleRequest, RescheduleResponse}
 import org.junit.runner.RunWith
@@ -45,7 +50,7 @@ import org.scalatest.flatspec.AnyFlatSpecLike
 import org.scalatest.matchers.should.Matchers
 
 import scala.collection.mutable.ArrayBuffer
-import scala.concurrent.Future
+import scala.concurrent.{Future, Promise}
 import scala.concurrent.duration._
 
 @RunWith(classOf[JUnitRunner])
@@ -151,6 +156,45 @@ class ActivationClientProxyTests
 
     machine ! RequestActivation()
     probe.expectMsg(message)
+  }
+
+  it should "send the opaque target binding id on every fetch" in within(timeout) {
+    val fetched = Promise[FetchRequest]()
+    val fetch = (request: FetchRequest) => {
+      fetched.trySuccess(request)
+      Future(grpc.FetchResponse(AResponse(Right(message)).serialize))
+    }
+    val client = (_: String, _: FullyQualifiedEntityName, _: String, _: Int, _: Boolean) =>
+      Future(MockActivationServiceClient(fetch))
+    val probe = TestProbe()
+    val machine = probe.childActorOf(
+      ActivationClientProxy
+        .props(invocationNamespace.asString, fqn, rev, schedulerHost, rpcPort, containerId, client, Some(73L)))
+    registerCallback(machine, probe)
+    ready(machine, probe)
+
+    machine ! RequestActivation()
+    probe.expectMsg(message)
+    fetched.future.futureValue.targetBindingId shouldBe Some(73L)
+  }
+
+  it should "surface target reencryption errors instead of retrying as no activation" in within(timeout) {
+    val fetch = (_: FetchRequest) =>
+      Future(grpc.FetchResponse(AResponse(Left(TargetReencryptionError("intentional failure"))).serialize))
+    val client = (_: String, _: FullyQualifiedEntityName, _: String, _: Int, _: Boolean) =>
+      Future(MockActivationServiceClient(fetch))
+    val probe = TestProbe()
+    val machine = probe.childActorOf(
+      ActivationClientProxy
+        .props(invocationNamespace.asString, fqn, rev, schedulerHost, rpcPort, containerId, client, Some(73L)))
+    registerCallback(machine, probe)
+    ready(machine, probe)
+
+    machine ! RequestActivation()
+    probe.expectMsgPF() {
+      case Failure(t) => t.getMessage should include("target-bound activation fetch failed")
+    }
+    probe.expectMsg(Transition(machine, ClientProxyReady, ClientProxyRemoving))
   }
 
   it should "be recreated when scheduler is changed" in within(timeout) {

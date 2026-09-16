@@ -46,6 +46,9 @@ message FetchRequest {
     google.protobuf.Int64Value lastDuration = 7;
     // to record alive containers
     bool alive = 8;
+    // Opaque control-side binding for the concrete container. Absent for
+    // profiles that do not use target-bound dispatch; zero is never valid.
+    google.protobuf.UInt64Value targetBindingId = 9;
 }
 
 // The response message
@@ -64,4 +67,3 @@ message RescheduleResponse {
     // if reschedule request is failed, then it will be `false`
     bool isRescheduled = 1;
 }
-

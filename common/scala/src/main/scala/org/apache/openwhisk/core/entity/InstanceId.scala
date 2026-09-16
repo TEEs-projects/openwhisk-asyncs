@@ -146,7 +146,25 @@ object ControllerInstanceId extends DefaultJsonProtocol {
 }
 
 object SchedulerInstanceId extends DefaultJsonProtocol {
-  implicit val serdes = jsonFormat(SchedulerInstanceId.apply _, "asString")
+  implicit val serdes = new RootJsonFormat[SchedulerInstanceId] {
+    override def write(s: SchedulerInstanceId): JsValue =
+      JsObject("asString" -> JsString(s.asString), "instanceType" -> JsString(s.instanceType))
+
+    override def read(json: JsValue): SchedulerInstanceId = {
+      json.asJsObject.getFields("asString", "instanceType") match {
+        case Seq(JsString(asString), JsString(instanceType)) =>
+          if (instanceType == "scheduler") {
+            new SchedulerInstanceId(asString)
+          } else {
+            deserializationError("could not read SchedulerInstanceId")
+          }
+        case Seq(JsString(asString)) =>
+          new SchedulerInstanceId(asString)
+        case _ =>
+          deserializationError("could not read SchedulerInstanceId")
+      }
+    }
+  }
 }
 
 trait InstanceId {
@@ -187,10 +205,12 @@ object InstanceId extends DefaultJsonProtocol {
             json.convertTo[InvokerInstanceId]
           case "controller" =>
             json.convertTo[ControllerInstanceId]
+          case "scheduler" =>
+            json.convertTo[SchedulerInstanceId]
           case _ =>
             deserializationError("could not read InstanceId")
         })
-        .getOrElse(deserializationError("could not read InstanceId"))
+        .getOrElse(json.convertTo[SchedulerInstanceId])
     }
   }
 }

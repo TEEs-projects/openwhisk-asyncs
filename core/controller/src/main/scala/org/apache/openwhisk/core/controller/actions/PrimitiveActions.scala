@@ -17,16 +17,18 @@
 
 package org.apache.openwhisk.core.controller.actions
 
+import java.lang.management.ManagementFactory
 import java.time.{Clock, Instant}
 
 import org.apache.pekko.actor.ActorSystem
 import org.apache.pekko.event.Logging.InfoLevel
+import org.apache.pekko.http.scaladsl.model.StatusCodes.BadRequest
 import spray.json.DefaultJsonProtocol._
 import spray.json._
 import org.apache.openwhisk.common.tracing.WhiskTracerProvider
 import org.apache.openwhisk.common.{Logging, LoggingMarkers, TransactionId, UserEvents}
 import org.apache.openwhisk.core.connector.{ActivationMessage, EventMessage, MessagingProvider}
-import org.apache.openwhisk.core.controller.WhiskServices
+import org.apache.openwhisk.core.controller.{RejectRequest, WhiskServices}
 import org.apache.openwhisk.core.database.{ActivationStore, NoDocumentException, UserContext}
 import org.apache.openwhisk.core.entitlement.{Resource, _}
 import org.apache.openwhisk.core.entity.ActivationResponse.ERROR_FIELD
@@ -74,6 +76,93 @@ protected[actions] trait PrimitiveActions {
   /** Message producer. This is needed to write user-metrics. */
   private val messagingProvider = SpiLoader.get[MessagingProvider]
   private val producer = messagingProvider.getProducer(services.whiskConfig)
+  private val c1TimingProcessId = ManagementFactory.getRuntimeMXBean.getName.takeWhile(_ != '@')
+  private val c1TimingNode = sys.env.get("C1_TIMING_NODE_ID").orElse(sys.env.get("HOSTNAME")).getOrElse("")
+
+  private def c1TimingSanitize(value: String): String =
+    value.replace('|', '_').replace('\n', ' ').replace('\r', ' ')
+
+  private def c1TimingField(key: String, value: String): String = s"$key=${c1TimingSanitize(value)}"
+
+  private def emitC1BackendPressureSubmit(metadata: BackendPressureMetadata, activationId: ActivationId)(
+    implicit transid: TransactionId): Unit = {
+    val fields = Seq(
+      c1TimingField("run_id", metadata.runId),
+      c1TimingField("logical_request_id", metadata.logicalRequestId),
+      c1TimingField("attempt_id", metadata.attemptId.toString),
+      c1TimingField("activation_id", activationId.asString),
+      c1TimingField("profile", metadata.profile),
+      c1TimingField("concurrency", metadata.concurrency.toString),
+      c1TimingField("request_generation_mode", metadata.requestGenerationMode),
+      c1TimingField("target_arrival_rate_per_sec", metadata.targetArrivalRatePerSec.toString),
+      c1TimingField("duration_sec", metadata.durationSec.toString),
+      c1TimingField("planned_logical_requests", metadata.plannedLogicalRequests.toString),
+      c1TimingField("ramp_stage_index", metadata.rampStageIndex.map(_.toString).getOrElse("")),
+      c1TimingField("ramp_stage_rate_per_sec", metadata.rampStageRatePerSec.map(_.toString).getOrElse("")),
+      c1TimingField("ramp_stage_start_offset_ns", metadata.rampStageStartOffsetNs.map(_.toString).getOrElse("")),
+      c1TimingField("ramp_stage_end_offset_ns", metadata.rampStageEndOffsetNs.map(_.toString).getOrElse("")),
+      c1TimingField("planned_submit_offset_ns", metadata.plannedSubmitOffsetNs.map(_.toString).getOrElse("")),
+      c1TimingField("planned_submit_mono_ns", metadata.plannedSubmitMonoNs.toString),
+      c1TimingField("actual_submit_mono_ns", metadata.actualSubmitMonoNs.toString),
+      c1TimingField("source_schedule_lag_ns", metadata.sourceScheduleLagNs.toString))
+    logging.info(this, s"C1_BACKEND_PRESSURE_SUBMIT|${fields.mkString("|")}")(transid)
+  }
+
+  private def c1BackendPressureActivationKind(activation: WhiskActivation): Option[String] =
+    activation.annotations.get(WhiskActivation.kindAnnotation).collect { case JsString(kind) => kind }
+
+  private def isC1BackendPressureSchedulerFallback(activation: WhiskActivation): Boolean =
+    activation.response.isWhiskError &&
+      activation.duration.contains(0L) &&
+      c1BackendPressureActivationKind(activation).contains("unknown")
+
+  private def isC1BackendPressureScheduledActionFailure(activation: WhiskActivation): Boolean =
+    activation.response.result.exists {
+      case JsObject(fields) =>
+        def scheduledFailureMarker(values: Map[String, JsValue]) =
+          values.get("scheduled_failure").contains(JsBoolean(true)) ||
+            values.get("failure_type").contains(JsString("scheduled_failure"))
+        scheduledFailureMarker(fields) ||
+          fields.get(ActivationResponse.ERROR_FIELD).exists {
+            case JsObject(errorFields) => scheduledFailureMarker(errorFields)
+            case _                     => false
+          }
+      case _ => false
+    }
+
+  private def emitC1BackendPressureSchedulerFallbackRetry(metadata: BackendPressureMetadata,
+                                                          activation: WhiskActivation,
+                                                          remainingRetries: Int)(
+    implicit transid: TransactionId): Unit = {
+    val fields = Seq(
+      c1TimingField("run_id", metadata.runId),
+      c1TimingField("logical_request_id", metadata.logicalRequestId),
+      c1TimingField("attempt_id", metadata.attemptId.toString),
+      c1TimingField("activation_id", activation.activationId.asString),
+      c1TimingField("retry_reason", "scheduler_internal_fallback"),
+      c1TimingField("remaining_retries", remainingRetries.toString))
+    logging.info(this, s"C1_BACKEND_PRESSURE_SCHEDULER_FALLBACK_RETRY|${fields.mkString("|")}")(transid)
+  }
+
+  private def emitC1TimingEvent(eventCode: String,
+                                boundaryName: String,
+                                activationId: ActivationId)(implicit transid: TransactionId): Unit = {
+    val unixNs = System.currentTimeMillis() * 1000000L
+    val monoNs = System.nanoTime()
+    val fields = Seq(
+      c1TimingField("event_code", eventCode),
+      c1TimingField("boundary_name", boundaryName),
+      c1TimingField("activation_id", activationId.asString),
+      c1TimingField("transaction_id", transid.id),
+      c1TimingField("node", c1TimingNode),
+      c1TimingField("process", "openwhisk_controller"),
+      c1TimingField("pid", c1TimingProcessId),
+      c1TimingField("tid", transid.id),
+      c1TimingField("unix_ns", unixNs.toString),
+      c1TimingField("mono_ns", monoNs.toString),
+      c1TimingField("clock_domain", "openwhisk_controller_jvm_mono"))
+    logging.info(this, s"C1TIMING_EVENT|${fields.mkString("|")}")(transid)
+  }
 
   /** A method that knows how to invoke a sequence of actions. */
   protected[actions] def invokeSequence(
@@ -120,6 +209,92 @@ protected[actions] trait PrimitiveActions {
     }
   }
 
+  protected[controller] def invokeBackendPressureAction(
+    user: Identity,
+    action: WhiskActionMetaData,
+    payload: Option[JsValue],
+    metadata: BackendPressureMetadata)(implicit transid: TransactionId): Future[BackendPressureActivationResult] = {
+    action.toExecutableWhiskAction match {
+      case Some(executable) if executable.exec.deprecated =>
+        Future.failed(RejectRequest(BadRequest, runtimeDeprecated(action.exec)))
+      case Some(executable) if executable.annotations.isTruthy(WhiskActivation.conductorAnnotation) =>
+        Future.failed(RejectRequest(BadRequest, "C1 backend-pressure source supports primitive actions only"))
+      case Some(executable) =>
+        invokeSimpleAction(user, executable, payload, None, cause = None, backendPressure = Some(metadata)).map {
+          case Right(activation) =>
+            BackendPressureActivationResult(
+              activation.activationId,
+              BackendPressureActivationResult.Completed,
+              "active_ack_result_ready",
+              metadata.attemptId)
+          case Left(activationId) =>
+            BackendPressureActivationResult(
+              activationId,
+              BackendPressureActivationResult.NotReady,
+              "active_ack_returned_activation_id",
+              metadata.attemptId)
+        }
+      case None =>
+        Future.failed(RejectRequest(BadRequest, "C1 backend-pressure source supports primitive actions only"))
+    }
+  }
+
+  protected[controller] def invokeBackendPressureBlockingAction(
+    user: Identity,
+    action: WhiskActionMetaData,
+    payload: Option[JsValue],
+    metadata: BackendPressureMetadata,
+    schedulerFallbackRetryLimit: Int = 0)(implicit transid: TransactionId): Future[BackendPressureActivationResult] = {
+    action.toExecutableWhiskAction match {
+      case Some(executable) if executable.exec.deprecated =>
+        Future.failed(RejectRequest(BadRequest, runtimeDeprecated(action.exec)))
+      case Some(executable) if executable.annotations.isTruthy(WhiskActivation.conductorAnnotation) =>
+        Future.failed(RejectRequest(BadRequest, "C1 backend-pressure source supports primitive actions only"))
+      case Some(executable) =>
+        def invokeWithRetry(currentMetadata: BackendPressureMetadata,
+                            remainingRetries: Int): Future[BackendPressureActivationResult] = {
+          invokeSimpleAction(
+            user,
+            executable,
+            payload,
+            Some(executable.limits.timeout.duration + 1.minute),
+            cause = None,
+            backendPressure = Some(currentMetadata)).flatMap {
+            case Right(activation) if isC1BackendPressureSchedulerFallback(activation) && remainingRetries > 0 =>
+              emitC1BackendPressureSchedulerFallbackRetry(currentMetadata, activation, remainingRetries)
+              invokeWithRetry(currentMetadata.copy(attemptId = currentMetadata.attemptId + 1), remainingRetries - 1)
+            case Right(activation) =>
+              val (status, reason) =
+                if (isC1BackendPressureSchedulerFallback(activation) && schedulerFallbackRetryLimit > 0) {
+                  (BackendPressureActivationResult.Failed, "scheduler_internal_fallback_exhausted")
+                } else if (isC1BackendPressureScheduledActionFailure(activation)) {
+                  (BackendPressureActivationResult.Failed, "action_level_scheduled_failure")
+                } else if (activation.response.isWhiskError) {
+                  (BackendPressureActivationResult.Failed, "blocking_activation_result_failed")
+                } else {
+                  (BackendPressureActivationResult.Completed, "blocking_activation_result_ready")
+                }
+              Future.successful(
+                BackendPressureActivationResult(
+                  activation.activationId,
+                  status,
+                  reason,
+                  currentMetadata.attemptId))
+            case Left(activationId) =>
+              Future.successful(
+                BackendPressureActivationResult(
+                  activationId,
+                  BackendPressureActivationResult.NotReady,
+                  "blocking_activation_result_not_ready",
+                  currentMetadata.attemptId))
+          }
+        }
+        invokeWithRetry(metadata, math.max(0, schedulerFallbackRetryLimit))
+      case None =>
+        Future.failed(RejectRequest(BadRequest, "C1 backend-pressure source supports primitive actions only"))
+    }
+  }
+
   /**
    * A method that knows how to invoke a single primitive action.
    *
@@ -154,7 +329,10 @@ protected[actions] trait PrimitiveActions {
     action: ExecutableWhiskActionMetaData,
     payload: Option[JsValue],
     waitForResponse: Option[FiniteDuration],
-    cause: Option[ActivationId])(implicit transid: TransactionId): Future[Either[ActivationId, WhiskActivation]] = {
+    cause: Option[ActivationId],
+    backendPressure: Option[BackendPressureMetadata] = None)(
+    implicit transid: TransactionId): Future[Either[ActivationId, WhiskActivation]] = {
+    val ctrlStartNs = System.nanoTime() // [# breakpoints]
 
     // merge package parameters with action (action parameters supersede), then merge in payload
     val args: Option[JsValue] = payload match {
@@ -163,6 +341,9 @@ protected[actions] trait PrimitiveActions {
       case _                       => Some(action.parameters.toJsObject)
     }
     val activationId = activationIdFactory.make()
+    emitC1TimingEvent("OW120", "openwhisk_controller_invoke_enter", activationId)
+    emitC1TimingEvent("OW150", "openwhisk_activation_id_created", activationId)
+    backendPressure.foreach(emitC1BackendPressureSubmit(_, activationId))
 
     val startActivation = transid.started(
       this,
@@ -177,6 +358,16 @@ protected[actions] trait PrimitiveActions {
       case Some(JsObject(fields)) => Some(fields.keySet)
       case _                      => None
     }
+    val ctrlEnqueueNs = System.nanoTime() // [# breakpoints]
+    val ctrlDurNs = math.max(0L, ctrlEnqueueNs - ctrlStartNs) // [# breakpoints]
+    val baseMetrics = Map(
+      "ow_ctrl_dur_ns" -> ctrlDurNs, // [# breakpoints]
+      "ow_ctrl_enqueue_ns" -> ctrlEnqueueNs // [# breakpoints]
+    )
+    val metrics = backendPressure
+      .map(_ => baseMetrics + ("c1_backend_pressure" -> 1L))
+      .getOrElse(baseMetrics)
+    val blocking = waitForResponse.isDefined
     val message = ActivationMessage(
       transid,
       FullyQualifiedEntityName(action.namespace, action.name, Some(action.version), action.binding),
@@ -184,12 +375,13 @@ protected[actions] trait PrimitiveActions {
       user,
       activationId, // activation id created here
       activeAckTopicIndex,
-      waitForResponse.isDefined,
+      blocking,
       args,
       action.parameters.initParameters,
       action.parameters.lockedParameters(keySet.getOrElse(Set.empty)),
       cause = cause,
-      WhiskTracerProvider.tracer.getTraceContext(transid))
+      WhiskTracerProvider.tracer.getTraceContext(transid),
+      metrics = metrics)
 
     val postedFuture = loadBalancer.publish(action, message)
 
@@ -197,16 +389,21 @@ protected[actions] trait PrimitiveActions {
       case Success(_) => transid.finished(this, startLoadbalancer)
       case Failure(e) => transid.failed(this, startLoadbalancer, e.getMessage)
     } flatMap { activeAckResponse =>
-      // is caller waiting for the result of the activation?
-      waitForResponse
-        .map { timeout =>
-          // yes, then wait for the activation response from the message bus
-          // (known as the active response or active ack)
-          waitForActivationResponse(user, message.activationId, timeout, activeAckResponse)
-        }
-        .getOrElse {
-          // no, return the activation id
-          Future.successful(Left(message.activationId))
+      backendPressure match {
+        case Some(_) if waitForResponse.isEmpty =>
+          activeAckResponse
+        case _ =>
+          // is caller waiting for the result of the activation?
+          waitForResponse
+            .map { timeout =>
+              // yes, then wait for the activation response from the message bus
+              // (known as the active response or active ack)
+              waitForActivationResponse(user, message.activationId, timeout, activeAckResponse)
+            }
+            .getOrElse {
+              // no, return the activation id
+              Future.successful(Left(message.activationId))
+            }
         }
     } andThen {
       case Success(_) => transid.finished(this, startActivation)
@@ -287,7 +484,7 @@ protected[actions] trait PrimitiveActions {
 
     val session = Session(
       activationId = activationIdFactory.make(),
-      start = Instant.now(Clock.systemUTC()),
+      start = Instant.now(Clock.systemUTC()), // [# breakpoints]
       action,
       cause,
       duration = 0,
@@ -582,7 +779,7 @@ protected[actions] trait PrimitiveActions {
     val binding =
       session.action.binding.map(f => Parameters(WhiskActivation.bindingAnnotation, JsString(f.asString)))
 
-    val end = Instant.now(Clock.systemUTC())
+    val end = Instant.now(Clock.systemUTC()) // [# breakpoints]
 
     // create the whisk activation
     val activation = WhiskActivation(

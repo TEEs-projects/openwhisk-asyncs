@@ -1,4 +1,5 @@
 *
 !init.sh
+!docker-*.tgz
 !build/distributions
 !build/tmp/docker-coverage

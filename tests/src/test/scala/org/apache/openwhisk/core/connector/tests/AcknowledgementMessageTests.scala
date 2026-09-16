@@ -136,4 +136,21 @@ class AcknowledgementMessageTests extends AnyFlatSpec with Matchers with WhiskIn
       AcknowledgementMessage.parse(c.serialize) shouldBe Success(c)
     }
   }
+
+  it should "deserialize scheduler fallback system-error completion result from 207" in {
+    val raw =
+      """{"instance":{"asString":"0"},"isSystemError":true,"response":{"activationId":"3bb82da0534f441fb82da0534ff41f9f","annotations":[{"key":"path","value":"guest/c1_backend_pressure_native_hash_207_ccompletion-window"},{"key":"kind","value":"unknown"}],"duration":0,"end":1783600834930,"logs":[],"name":"c1_backend_pressure_native_hash_207_ccompletion-window","namespace":"guest","publish":false,"response":{"result":{"error":"Unexpected http response code: 403 Forbidden (details: {\"error\":\"forbidden\",\"reason\":\"You are not allowed to access this db.\"}\n)"},"statusCode":3},"start":1783600834930,"subject":"guest","version":"0.0.1"},"transid":["oC8O9TMSgKbN4vngKYy3BvTENY0iZNmL",1783600834454,["t70qtIvK7vTzVY6MkjKbIHFYElYB8kBB",1783600834241]]}"""
+
+    val parsed = AcknowledgementMessage.parse(raw)
+    parsed.isSuccess shouldBe true
+    val message = parsed.get
+    message shouldBe a[CombinedCompletionAndResultMessage]
+    message.isSlotFree shouldBe Some(SchedulerInstanceId("0"))
+    message.isSystemError shouldBe Some(true)
+    message.result should not be empty
+    val response = message.result.get
+    response shouldBe 'right
+    response.right.get.activationId.asString shouldBe "3bb82da0534f441fb82da0534ff41f9f"
+    response.right.get.response.statusCode shouldBe 3
+  }
 }

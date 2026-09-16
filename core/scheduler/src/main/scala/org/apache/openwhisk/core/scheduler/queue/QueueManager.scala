@@ -713,22 +713,28 @@ object MemoryQueueErrorSerdes {
   private implicit val noMessageSerdes = NoActivationMessage.serdes
   private implicit val noQueueSerdes = NoMemoryQueue.serdes
   private implicit val mismatchSerdes = ActionMismatch.serdes
+  private implicit val targetBindingSerdes = TargetBindingError.serdes
+  private implicit val targetReencryptionSerdes = TargetReencryptionError.serdes
 
   // format that discriminates based on an additional
   // field "type" that can either be "Cat" or "Dog"
   implicit val memoryQueueErrorFormat = new RootJsonFormat[MemoryQueueError] {
     def write(obj: MemoryQueueError): JsValue =
       JsObject((obj match {
-        case msg: NoActivationMessage => msg.toJson
-        case msg: NoMemoryQueue       => msg.toJson
-        case msg: ActionMismatch      => msg.toJson
+        case msg: NoActivationMessage     => msg.toJson
+        case msg: NoMemoryQueue           => msg.toJson
+        case msg: ActionMismatch          => msg.toJson
+        case msg: TargetBindingError      => msg.toJson
+        case msg: TargetReencryptionError => msg.toJson
       }).asJsObject.fields + ("type" -> JsString(obj.productPrefix)))
 
     def read(json: JsValue): MemoryQueueError =
       json.asJsObject.getFields("type") match {
-        case Seq(JsString("NoActivationMessage")) => json.convertTo[NoActivationMessage]
-        case Seq(JsString("NoMemoryQueue"))       => json.convertTo[NoMemoryQueue]
-        case Seq(JsString("ActionMismatch"))      => json.convertTo[ActionMismatch]
+        case Seq(JsString("NoActivationMessage"))     => json.convertTo[NoActivationMessage]
+        case Seq(JsString("NoMemoryQueue"))           => json.convertTo[NoMemoryQueue]
+        case Seq(JsString("ActionMismatch"))          => json.convertTo[ActionMismatch]
+        case Seq(JsString("TargetBindingError"))      => json.convertTo[TargetBindingError]
+        case Seq(JsString("TargetReencryptionError")) => json.convertTo[TargetReencryptionError]
       }
   }
 }
@@ -766,6 +772,25 @@ object ActionMismatch extends DefaultJsonProtocol {
   val asString: String = "action version does not match"
   def parse(msg: String) = Try(serdes.read(msg.parseJson))
   implicit val serdes = jsonFormat(ActionMismatch.apply _, "actionMisMatch")
+}
+
+case class TargetBindingError(targetBindingError: String) extends MemoryQueueError with Message {
+  override val causedBy: String = targetBindingError
+  override def serialize = TargetBindingError.serdes.write(this).compactPrint
+}
+
+object TargetBindingError extends DefaultJsonProtocol {
+  def invalid(id: Long): TargetBindingError = TargetBindingError(s"target binding id must be positive: $id")
+  implicit val serdes = jsonFormat(TargetBindingError.apply _, "targetBindingError")
+}
+
+case class TargetReencryptionError(targetReencryptionError: String) extends MemoryQueueError with Message {
+  override val causedBy: String = targetReencryptionError
+  override def serialize = TargetReencryptionError.serdes.write(this).compactPrint
+}
+
+object TargetReencryptionError extends DefaultJsonProtocol {
+  implicit val serdes = jsonFormat(TargetReencryptionError.apply _, "targetReencryptionError")
 }
 
 object QueuePool {

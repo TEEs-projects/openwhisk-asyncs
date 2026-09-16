@@ -130,14 +130,14 @@ sealed abstract trait ContainerNotInUse {
 case class NoData(override val activeActivationCount: Int = 0)
     extends ContainerNotStarted(Instant.EPOCH, 0.B, activeActivationCount)
     with ContainerNotInUse {
-  override def nextRun(r: Run) = WarmingColdData(r.msg.user.namespace.name, r.action, Instant.now, 1)
+  override def nextRun(r: Run) = WarmingColdData(r.msg.user.namespace.name, r.action, Instant.now, 1) // [# breakpoints]
 }
 
 /** type representing a cold (not running) container with specific memory allocation */
 case class MemoryData(override val memoryLimit: ByteSize, override val activeActivationCount: Int = 0)
     extends ContainerNotStarted(Instant.EPOCH, memoryLimit, activeActivationCount)
     with ContainerNotInUse {
-  override def nextRun(r: Run) = WarmingColdData(r.msg.user.namespace.name, r.action, Instant.now, 1)
+  override def nextRun(r: Run) = WarmingColdData(r.msg.user.namespace.name, r.action, Instant.now, 1) // [# breakpoints]
 }
 
 /** type representing a prewarmed (running, but unused) container (with a specific memory allocation) */
@@ -150,7 +150,7 @@ case class PreWarmedData(override val container: Container,
     with ContainerNotInUse {
   override val initingState = "prewarmed"
   override def nextRun(r: Run) =
-    WarmingData(container, r.msg.user.namespace.name, r.action, Instant.now, 1)
+    WarmingData(container, r.msg.user.namespace.name, r.action, Instant.now, 1) // [# breakpoints]
   def isExpired(): Boolean = expires.exists(_.isOverdue())
 }
 
@@ -163,7 +163,7 @@ case class WarmingData(override val container: Container,
     extends ContainerStarted(container, lastUsed, action.limits.memory.megabytes.MB, activeActivationCount)
     with ContainerInUse {
   override val initingState = "warming"
-  override def nextRun(r: Run) = copy(lastUsed = Instant.now, activeActivationCount = activeActivationCount + 1)
+  override def nextRun(r: Run) = copy(lastUsed = Instant.now, activeActivationCount = activeActivationCount + 1) // [# breakpoints]
 }
 
 /** type representing a cold (not yet running) container that is being initialized (for a specific action + invocation namespace) */
@@ -174,7 +174,7 @@ case class WarmingColdData(invocationNamespace: EntityName,
     extends ContainerNotStarted(lastUsed, action.limits.memory.megabytes.MB, activeActivationCount)
     with ContainerInUse {
   override val initingState = "warmingCold"
-  override def nextRun(r: Run) = copy(lastUsed = Instant.now, activeActivationCount = activeActivationCount + 1)
+  override def nextRun(r: Run) = copy(lastUsed = Instant.now, activeActivationCount = activeActivationCount + 1) // [# breakpoints]
 }
 
 /** type representing a warm container that has already been in use (for a specific action + invocation namespace) */
@@ -187,7 +187,7 @@ case class WarmedData(override val container: Container,
     extends ContainerStarted(container, lastUsed, action.limits.memory.megabytes.MB, activeActivationCount)
     with ContainerInUse {
   override val initingState = "warmed"
-  override def nextRun(r: Run) = copy(lastUsed = Instant.now, activeActivationCount = activeActivationCount + 1)
+  override def nextRun(r: Run) = copy(lastUsed = Instant.now, activeActivationCount = activeActivationCount + 1) // [# breakpoints]
   //track the resuming run for easily referring to the action being resumed (it may fail and be resent)
   def withoutResumeRun() = this.copy(resumeRun = None)
   def withResumeRun(job: Run) = this.copy(resumeRun = Some(job))
@@ -302,6 +302,7 @@ class ContainerProxy(factory: (TransactionId,
       implicit val transid = job.msg.transid
       activeCount += 1
       // create a new container
+      val createStartNs = System.nanoTime() // [# breakpoints]
       val container = factory(
         job.msg.transid,
         ContainerProxy.containerName(instance, job.msg.user.namespace.name.asString, job.action.name.asString),
@@ -347,8 +348,11 @@ class ContainerProxy(factory: (TransactionId,
             storeActivation(transid, activation, job.msg.blocking, context)
         }
         .flatMap { container =>
+          val createDurNs = math.max(0L, System.nanoTime() - createStartNs) // [# breakpoints]
+          val metrics = job.msg.metrics + ("ow_container_create_dur_ns" -> createDurNs) // [# breakpoints]
+          val jobWithMetrics = job.copy(msg = job.msg.copy(metrics = metrics))
           // now attempt to inject the user code and run the action
-          initializeAndRun(container, job)
+          initializeAndRun(container, jobWithMetrics)
             .map(_ => RunCompleted)
         }
         .pipeTo(self)
@@ -802,7 +806,7 @@ class ContainerProxy(factory: (TransactionId,
         Future.successful(None)
       case _ =>
         val owEnv = (authEnvironment ++ environment ++ Map(
-          "deadline" -> (Instant.now.toEpochMilli + actionTimeout.toMillis).toString.toJson)) map {
+          "deadline" -> (Instant.now.toEpochMilli + actionTimeout.toMillis).toString.toJson)) map { // [# breakpoints]
           case (key, value) => "__OW_" + key.toUpperCase -> value
         }
 
@@ -819,13 +823,13 @@ class ContainerProxy(factory: (TransactionId,
       .flatMap { initInterval =>
         //immediately setup warmedData for use (before first execution) so that concurrent actions can use it asap
         if (initInterval.isDefined) {
-          self ! InitCompleted(WarmedData(container, job.msg.user.namespace.name, job.action, Instant.now, 1))
+          self ! InitCompleted(WarmedData(container, job.msg.user.namespace.name, job.action, Instant.now, 1)) // [# breakpoints]
         }
 
         val env = authEnvironment ++ environment ++ Map(
           // compute deadline on invoker side avoids discrepancies inside container
           // but potentially under-estimates actual deadline
-          "deadline" -> (Instant.now.toEpochMilli + actionTimeout.toMillis).toString.toJson)
+          "deadline" -> (Instant.now.toEpochMilli + actionTimeout.toMillis).toString.toJson) // [# breakpoints]
 
         container
           .run(
@@ -1057,6 +1061,20 @@ object ContainerProxy {
       initInterval.map(initTime => Parameters(WhiskActivation.initTimeAnnotation, initTime.duration.toMillis.toJson))
     }
 
+    val initMetrics = initInterval
+      .map(interval => Map("ow_container_init_dur_ns" -> interval.duration.toNanos)) // [# breakpoints]
+      .getOrElse(Map.empty)
+    val durationMetrics = (job.msg.metrics ++ initMetrics)
+      .collect {
+        case (k, v) if k.endsWith("_dur_ns") => (k, JsNumber(v))
+      }
+    val timingAnnotation =
+      if (durationMetrics.nonEmpty) {
+        Some(Parameters("ow_timings", JsObject(durationMetrics)))
+      } else {
+        None
+      }
+
     val binding =
       job.msg.action.binding.map(f => Parameters(WhiskActivation.bindingAnnotation, JsString(f.asString)))
 
@@ -1076,7 +1094,7 @@ object ContainerProxy {
           Parameters(WhiskActivation.pathAnnotation, JsString(job.action.fullyQualifiedName(false).asString)) ++
           Parameters(WhiskActivation.kindAnnotation, JsString(job.action.exec.kind)) ++
           Parameters(WhiskActivation.timeoutAnnotation, JsBoolean(isTimeout)) ++
-          causedBy ++ initTime ++ waitTime ++ binding
+          causedBy ++ initTime ++ waitTime ++ binding ++ timingAnnotation
       })
   }
 

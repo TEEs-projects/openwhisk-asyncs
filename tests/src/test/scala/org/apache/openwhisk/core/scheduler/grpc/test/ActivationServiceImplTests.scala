@@ -31,7 +31,8 @@ import org.apache.openwhisk.core.scheduler.queue.{
   MemoryQueueValue,
   NoActivationMessage,
   NoMemoryQueue,
-  QueuePool
+  QueuePool,
+  TargetBindingError
 }
 import org.apache.openwhisk.grpc.{FetchRequest, FetchResponse, RescheduleRequest, RescheduleResponse}
 import org.junit.runner.RunWith
@@ -117,6 +118,53 @@ class ActivationServiceImplTests
       .futureValue shouldBe FetchResponse(ActivationResponse(Right(message)).serialize)
 
     expectMsg(GetActivation(tid, testFQN, testContainerId, false, None))
+  }
+
+  it should "preserve a positive opaque target binding id" in {
+    val mock = system.actorOf(Props(new Actor() {
+      override def receive: Receive = {
+        case getActivation: GetActivation =>
+          testActor ! getActivation
+          sender() ! ActivationResponse(Right(message))
+      }
+    }))
+    QueuePool.put(MemoryQueueKey(testEntityPath.asString, testDoc), MemoryQueueValue(mock, true))
+    val activationServiceImpl = ActivationServiceImpl()
+    val tid = TransactionId(TransactionId.generateTid())
+
+    activationServiceImpl
+      .fetchActivation(
+        FetchRequest(
+          tid.serialize,
+          message.user.namespace.name.asString,
+          testFQN.serialize,
+          testDocRevision.serialize,
+          testContainerId,
+          false,
+          alive = true,
+          targetBindingId = Some(73L)))
+      .futureValue shouldBe FetchResponse(ActivationResponse(Right(message)).serialize)
+
+    expectMsg(GetActivation(tid, testFQN, testContainerId, false, None, targetBindingId = Some(73L)))
+  }
+
+  it should "reject a zero target binding id before queue lookup" in {
+    val activationServiceImpl = ActivationServiceImpl()
+
+    activationServiceImpl
+      .fetchActivation(
+        FetchRequest(
+          TransactionId(TransactionId.generateTid()).serialize,
+          message.user.namespace.name.asString,
+          testFQN.serialize,
+          testDocRevision.serialize,
+          testContainerId,
+          false,
+          alive = true,
+          targetBindingId = Some(0L)))
+      .futureValue shouldBe FetchResponse(ActivationResponse(Left(TargetBindingError.invalid(0L))).serialize)
+
+    expectNoMessage(200.millis)
   }
 
   it should "return without any retry if there is no such queue" in {

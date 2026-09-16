@@ -24,8 +24,10 @@ import org.apache.openwhisk.core.WhiskConfig
 import org.apache.openwhisk.core.connector.ContainerCreationError.{DBFetchError, InvalidActionLimitError}
 import org.apache.openwhisk.core.connector._
 import org.apache.openwhisk.core.containerpool.v2.{CreationContainer, DeletionContainer}
+import org.apache.openwhisk.core.containerpool.v2.TargetBindingProvider
 import org.apache.openwhisk.core.database.{ArtifactStore, DocumentRevisionMismatchException, NoDocumentException}
 import org.apache.openwhisk.core.entity._
+import org.apache.openwhisk.core.entity.Attachments.Inline
 import org.apache.openwhisk.http.Messages
 
 import java.nio.charset.StandardCharsets
@@ -68,8 +70,14 @@ class ContainerMessageConsumer(
 
         val createContainer = for {
           identity <- Identity.get(authStore, EntityName(creation.invocationNamespace))
-          action <- WhiskAction
-            .get(entityStore, creation.action.toDocId, creation.revision, fromCache = true)
+          action <- if (creation.whiskActionMetaData.exec.kind == TargetBindingProvider.ReusableConcurrencyKind) {
+            ContainerMessageConsumer.metadataOnlyAction(creation.whiskActionMetaData, creation.revision) match {
+              case Right(value)  => Future.successful(value)
+              case Left(message) => Future.failed(new IllegalStateException(message))
+            }
+          } else {
+            WhiskAction.get(entityStore, creation.action.toDocId, creation.revision, fromCache = true)
+          }
         } yield {
           // check action limits before creating container
           action.limits.checkLimits(identity)
@@ -135,5 +143,30 @@ class ContainerMessageConsumer(
 
   def close(): Unit = {
     feed ! GracefulShutdown
+  }
+}
+
+object ContainerMessageConsumer {
+  private[invoker] def metadataOnlyAction(metadata: WhiskActionMetaData,
+                                          exactRevision: DocRevision): Either[String, WhiskAction] = {
+    val executable = metadata.exec match {
+      case exec: CodeExecMetaDataAsString =>
+        Right(CodeExecAsAttachment(exec.manifest, Inline(""), exec.entryPoint, exec.binary))
+      case exec: CodeExecMetaDataAsAttachment =>
+        Right(CodeExecAsAttachment(exec.manifest, Inline(""), exec.entryPoint, exec.binary))
+      case _ => Left("reusable-concurrency metadata is not executable code")
+    }
+    executable.map { exec =>
+      WhiskAction(
+        metadata.namespace,
+        metadata.name,
+        exec,
+        metadata.parameters,
+        metadata.limits,
+        metadata.version,
+        metadata.publish,
+        metadata.annotations,
+        metadata.updated).revision[WhiskAction](exactRevision)
+    }
   }
 }

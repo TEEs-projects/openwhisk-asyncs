@@ -133,7 +133,7 @@ class QueueManagerTests
     (system: ActorRefFactory, _: String, _: FullyQualifiedEntityName, _: DocRevision, _: WhiskActionMetaData) =>
       system.actorOf(Props(new Actor() {
         override def receive: Receive = {
-          case GetActivation(_, _, _, _, _, _) =>
+          case GetActivation(_, _, _, _, _, _, _) =>
             sender ! ActivationResponse(Right(newActivation()))
           case GetState =>
             sender ! statusData
@@ -1157,7 +1157,7 @@ class QueueManagerTests
       (system: ActorRefFactory, _: String, _: FullyQualifiedEntityName, _: DocRevision, _: WhiskActionMetaData) => {
         system.actorOf(Props(new Actor() {
           override def receive: Receive = {
-            case GetActivation(_, _, _, _, _, _) =>
+            case GetActivation(_, _, _, _, _, _, _) =>
               sender ! ActivationResponse(Right(newActivation()))
 
             case GracefulShutdown =>

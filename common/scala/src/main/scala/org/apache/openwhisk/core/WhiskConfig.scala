@@ -313,6 +313,7 @@ object ConfigKeys {
   val schedulerScheduling = "whisk.scheduler.scheduling"
   val schedulerQueue = "whisk.scheduler.queue"
   val schedulerQueueManager = "whisk.scheduler.queue-manager"
+  val schedulerTargetBoundDispatch = "whisk.scheduler.target-bound-dispatch"
   val schedulerInProgressJobRetention = "whisk.scheduler.in-progress-job-retention"
   val schedulerBlackboxMultiple = "whisk.scheduler.blackbox-multiple"
   val schedulerStaleThreshold = "whisk.scheduler.stale-threshold"

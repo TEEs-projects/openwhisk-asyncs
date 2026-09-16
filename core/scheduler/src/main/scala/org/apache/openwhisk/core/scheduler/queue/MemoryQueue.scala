@@ -19,6 +19,7 @@ package org.apache.openwhisk.core.scheduler.queue
 
 import org.apache.pekko.actor.Status.{Failure => FailureMessage}
 import org.apache.pekko.actor.{ActorRef, ActorSystem, Cancellable, FSM, Props, Stash}
+import org.apache.pekko.pattern.pipe
 import org.apache.pekko.util.Timeout
 import org.apache.openwhisk.common._
 import org.apache.openwhisk.common.time.{Clock, SystemClock}
@@ -47,6 +48,7 @@ import pureconfig.loadConfigOrThrow
 import spray.json._
 import pureconfig.generic.auto._
 
+import java.lang.management.ManagementFactory
 import scala.collection.JavaConverters._
 import java.time.{Duration, Instant}
 import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
@@ -101,6 +103,17 @@ case class QueueReactivated(invocationNamespace: String, action: FullyQualifiedE
 case class CancelPoll(promise: Promise[Either[MemoryQueueError, ActivationMessage]])
 case object QueueRemovedCompleted
 
+private[queue] sealed trait ActivationDispatchRecipient
+private[queue] case class DirectDispatchRecipient(replyTo: ActorRef) extends ActivationDispatchRecipient
+private[queue] case class WaitingDispatchRecipient(promise: Promise[Either[MemoryQueueError, ActivationMessage]])
+    extends ActivationDispatchRecipient
+private[queue] case class PendingActivationDispatch(entry: TimeSeriesActivationEntry,
+                                                    request: GetActivation,
+                                                    recipient: ActivationDispatchRecipient,
+                                                    boundary: String)
+private[queue] case class ActivationDispatchCompleted(pending: PendingActivationDispatch,
+                                                      result: Either[TargetReencryptionError, ActivationMessage])
+
 // Events received by the actor
 case object Start
 case object VersionUpdated
@@ -144,14 +157,16 @@ class MemoryQueue(private val etcdClient: EtcdClient,
                                                WhiskActionMetaData,
                                                MemoryQueueState,
                                                ActorRef) => Unit,
-                  queueConfig: QueueConfig)(implicit logging: Logging, clock: Clock)
+                  queueConfig: QueueConfig,
+                  targetBoundActivationDispatcher: TargetBoundActivationDispatcher =
+                    TargetBoundActivationDispatcher.Unconfigured)(implicit logging: Logging, clock: Clock)
     extends FSM[MemoryQueueState, MemoryQueueData]
     with Stash {
 
   private implicit val ec: ExecutionContextExecutor = context.dispatcher
   private implicit val actorSystem: ActorSystem = context.system
   private implicit val timeout = Timeout(5.seconds)
-  private implicit val order: Ordering[BufferedRequest] = Ordering.by(_.containerId)
+  private implicit val order: Ordering[BufferedRequest] = Ordering.by(_.sortKey)
 
   private val StaleDuration = Duration.ofMillis(schedulingConfig.staleThreshold.toMillis)
   private val unversionedAction = action.copy(version = None)
@@ -180,6 +195,8 @@ class MemoryQueue(private val etcdClient: EtcdClient,
   private[queue] var averageDurationBuffer = AverageRingBuffer(queueConfig.durationBufferSize)
   private[queue] var limit: Option[Int] = None
   private[queue] var initialized = false
+  private val c1TimingProcessId = ManagementFactory.getRuntimeMXBean.getName.takeWhile(_ != '@')
+  private val c1TimingNode = sys.env.get("C1_TIMING_NODE_ID").orElse(sys.env.get("HOSTNAME")).getOrElse("")
 
   private val logScheduler: Cancellable = context.system.scheduler.scheduleWithFixedDelay(0.seconds, 1.seconds) { () =>
     MetricEmitter.emitGaugeMetric(
@@ -204,6 +221,33 @@ class MemoryQueue(private val etcdClient: EtcdClient,
   }
 
   getAverageDuration()
+
+  private def c1TimingSanitize(value: String): String =
+    value.replace('|', '_').replace('\n', ' ').replace('\r', ' ')
+
+  private def c1TimingField(key: String, value: String): String = s"$key=${c1TimingSanitize(value)}"
+
+  private def emitC1TimingEvent(msg: ActivationMessage,
+                                eventCode: String,
+                                boundaryName: String,
+                                deliveryPath: String): Unit = {
+    val unixNs = System.currentTimeMillis() * 1000000L
+    val monoNs = System.nanoTime()
+    val fields = Seq(
+      c1TimingField("event_code", eventCode),
+      c1TimingField("boundary_name", boundaryName),
+      c1TimingField("activation_id", msg.activationId.asString),
+      c1TimingField("transaction_id", msg.transid.id),
+      c1TimingField("delivery_path", deliveryPath),
+      c1TimingField("node", c1TimingNode),
+      c1TimingField("process", "openwhisk_scheduler"),
+      c1TimingField("pid", c1TimingProcessId),
+      c1TimingField("tid", msg.transid.id),
+      c1TimingField("unix_ns", unixNs.toString),
+      c1TimingField("mono_ns", monoNs.toString),
+      c1TimingField("clock_domain", "openwhisk_scheduler_jvm_mono"))
+    logging.info(this, s"C1TIMING_EVENT|${fields.mkString("|")}")(msg.transid)
+  }
 
   private val watcherName = s"memory-queue-$action-$revision"
   // watch existing containers for action and namespace
@@ -549,6 +593,9 @@ class MemoryQueue(private val etcdClient: EtcdClient,
       cancel.promise.trySuccess(Left(NoActivationMessage()))
 
       stay
+
+    case Event(completed: ActivationDispatchCompleted, _) =>
+      completeActivationDispatch(completed)
 
     // common case for Running, NamespaceThrottled, ActionThrottled, Removing
     case Event(msg: ActivationMessage, _) =>
@@ -1018,16 +1065,19 @@ class MemoryQueue(private val etcdClient: EtcdClient,
   }
 
   /* take the first uncompleted request from requestBuffer. */
-  private def takeUncompletedRequest(): Option[Promise[Either[MemoryQueueError, ActivationMessage]]] = {
+  private def takeUncompletedRequest(): Option[BufferedRequest] = {
     requestBuffer = requestBuffer.filter(!_.promise.isCompleted)
     if (requestBuffer.nonEmpty) {
-      Some(requestBuffer.dequeue.promise)
+      val buffered = requestBuffer.dequeue()
+      buffered.cancelPoll.cancel()
+      Some(buffered)
     } else None
   }
 
   private def removeDeletedContainerFromRequestBuffer(containerId: String): Unit = {
     requestBuffer = requestBuffer.filter { buffer =>
-      if (buffer.containerId.drop(1) == containerId) {
+      if (buffer.request.containerId == containerId) {
+        buffer.cancelPoll.cancel()
         buffer.promise.trySuccess(Left(NoActivationMessage()))
         false
       } else
@@ -1039,14 +1089,14 @@ class MemoryQueue(private val etcdClient: EtcdClient,
     logging.info(this, s"[$invocationNamespace:$action:$stateName] got a new activation message ${msg.activationId}")(
       msg.transid)
     in.incrementAndGet()
+    emitC1TimingEvent(msg, "OW260", "openwhisk_activation_queue_enter", "activation_queue_enter")
     takeUncompletedRequest()
-      .map { res =>
-        val totalTimeInScheduler = Interval(msg.transid.meta.start, Instant.now()).duration
-        MetricEmitter.emitHistogramMetric(
-          LoggingMarkers.SCHEDULER_WAIT_TIME(action.asString, action.toStringWithoutVersion),
-          totalTimeInScheduler.toMillis)
-        lastActivationPulledTime.set(Instant.now.toEpochMilli)
-        res.trySuccess(Right(msg))
+      .map { buffered =>
+        beginActivationDispatch(
+          TimeSeriesActivationEntry(clock.now(), msg),
+          buffered.request,
+          WaitingDispatchRecipient(buffered.promise),
+          "waiting_request_success_response")
         in.decrementAndGet()
         stay
       }
@@ -1061,20 +1111,15 @@ class MemoryQueue(private val etcdClient: EtcdClient,
     request.lastDuration.foreach(averageDurationBuffer.add(_))
 
     if (queue.nonEmpty) {
-      val (TimeSeriesActivationEntry(_, msg), newQueue) = queue.dequeue
+      val (entry, newQueue) = queue.dequeue
       queue = newQueue
+      val msg = entry.msg
       logging.info(
         this,
-        s"[$invocationNamespace:$action:$stateName] Get activation request ${request.containerId}, send one message: ${msg.activationId}")(
+        s"[$invocationNamespace:$action:$stateName] Get activation request ${request.containerId}, prepare one message: ${msg.activationId}")(
         msg.transid)
-      val totalTimeInScheduler = Interval(msg.transid.meta.start, Instant.now()).duration
-      MetricEmitter.emitHistogramMetric(
-        LoggingMarkers.SCHEDULER_WAIT_TIME(action.asString, action.toStringWithoutVersion),
-        totalTimeInScheduler.toMillis)
-      lastActivationPulledTime.set(Instant.now.toEpochMilli)
-
-      sender ! GetActivationResponse(Right(msg))
-      tryDisableActionThrottling()
+      beginActivationDispatch(entry, request, DirectDispatchRecipient(sender()), "direct_queued_activation_response")
+      stay
     } else {
       pollForActivation(sender, request)
       stay
@@ -1093,9 +1138,18 @@ class MemoryQueue(private val etcdClient: EtcdClient,
 
     // "1xxx" is always bigger than "0xxx", so warmed containers will be took first while dequeue from `requestBuffer`
     val warmedFlag = if (request.warmed) 1 else 0
-    requestBuffer.enqueue(BufferedRequest(warmedFlag + request.containerId, promise))
+    requestBuffer.enqueue(BufferedRequest(warmedFlag + request.containerId, request, promise, cancelPoll))
     promise.future.onComplete {
       case Success(value) =>
+        value match {
+          case Right(msg) =>
+            emitC1TimingEvent(
+              msg,
+              "OW300",
+              "openwhisk_scheduler_activation_dispatch_exit",
+              "waiting_request_success_response")
+          case Left(_) => // do nothing
+        }
         sender ! GetActivationResponse(value)
         value match {
           case Right(msg) =>
@@ -1103,9 +1157,9 @@ class MemoryQueue(private val etcdClient: EtcdClient,
               this,
               s"[$invocationNamespace:$action:$stateName] Send msg ${msg.activationId} to waiting request ${request.containerId}")(
               msg.transid)
-            cancelPoll.cancel()
-          case Left(_) => // do nothing
+          case Left(_) => // the error remains explicit in the response
         }
+        cancelPoll.cancel()
       case Failure(t) => // this shouldn't happen
         logging.error(
           this,
@@ -1114,6 +1168,51 @@ class MemoryQueue(private val etcdClient: EtcdClient,
         cancelPoll.cancel()
     }
   }
+
+  private def beginActivationDispatch(entry: TimeSeriesActivationEntry,
+                                      request: GetActivation,
+                                      recipient: ActivationDispatchRecipient,
+                                      boundary: String): Unit = {
+    val pending = PendingActivationDispatch(entry, request, recipient, boundary)
+    targetBoundActivationDispatcher
+      .prepare(request, entry.msg)
+      .recover {
+        case t =>
+          Left(TargetReencryptionError(s"target-bound dispatch failed: ${t.getClass.getSimpleName}"))
+      }
+      .map(ActivationDispatchCompleted(pending, _))
+      .pipeTo(self)
+  }
+
+  private def completeActivationDispatch(completed: ActivationDispatchCompleted): State = {
+    val pending = completed.pending
+    implicit val tid: TransactionId = pending.entry.msg.transid
+    completed.result match {
+      case Right(msg) =>
+        val totalTimeInScheduler = Interval(msg.transid.meta.start, Instant.now()).duration
+        MetricEmitter.emitHistogramMetric(
+          LoggingMarkers.SCHEDULER_WAIT_TIME(action.asString, action.toStringWithoutVersion),
+          totalTimeInScheduler.toMillis)
+        lastActivationPulledTime.set(Instant.now.toEpochMilli)
+        emitC1TimingEvent(msg, "OW300", "openwhisk_scheduler_activation_dispatch_exit", pending.boundary)
+        completeDispatchRecipient(pending.recipient, Right(msg))
+        tryDisableActionThrottling()
+      case Left(error) =>
+        // The original activation remains owned by this queue until H2 has
+        // produced a target-bound response. Explicit failure returns it intact.
+        queue = Queue(pending.entry) ++ queue
+        completeDispatchRecipient(pending.recipient, Left(error))
+        tryEnableActionThrottling()
+    }
+    stay
+  }
+
+  private def completeDispatchRecipient(recipient: ActivationDispatchRecipient,
+                                        result: Either[MemoryQueueError, ActivationMessage]): Unit =
+    recipient match {
+      case DirectDispatchRecipient(replyTo)  => replyTo ! GetActivationResponse(result)
+      case WaitingDispatchRecipient(promise) => promise.trySuccess(result)
+    }
 
   /** Generates an activation with zero runtime. Usually used for error cases */
   private def generateFallbackActivation(msg: ActivationMessage, response: ActivationResponse): WhiskActivation = {
@@ -1166,7 +1265,9 @@ object MemoryQueue {
             schedulerId: SchedulerInstanceId,
             ack: ActiveAck,
             store: (TransactionId, WhiskActivation, UserContext) => Future[Any],
-            getUserLimit: String => Future[Int])(implicit logging: Logging): Props = {
+            getUserLimit: String => Future[Int],
+            targetBoundActivationDispatcher: TargetBoundActivationDispatcher =
+              TargetBoundActivationDispatcher.Unconfigured)(implicit logging: Logging): Props = {
     implicit val clock: Clock = SystemClock
     Props(
       new MemoryQueue(
@@ -1188,7 +1289,8 @@ object MemoryQueue {
         store,
         getUserLimit,
         checkToDropStaleActivation,
-        queueConfig))
+        queueConfig,
+        targetBoundActivationDispatcher))
   }
 
   @tailrec
@@ -1270,7 +1372,10 @@ case class QueueConfig(idleGrace: FiniteDuration,
                        durationBufferSize: Int,
                        failThrottleAsWhiskError: Boolean)
 
-case class BufferedRequest(containerId: String, promise: Promise[Either[MemoryQueueError, ActivationMessage]])
+case class BufferedRequest(sortKey: String,
+                           request: GetActivation,
+                           promise: Promise[Either[MemoryQueueError, ActivationMessage]],
+                           cancelPoll: Cancellable)
 
 case object DropOld
 

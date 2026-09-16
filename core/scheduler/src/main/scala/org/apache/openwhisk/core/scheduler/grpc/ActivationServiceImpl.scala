@@ -62,50 +62,56 @@ class ActivationServiceImpl()(implicit actorSystem: ActorSystem, logging: Loggin
   }
 
   override def fetchActivation(request: FetchRequest): Future[FetchResponse] = {
-    Future(for {
-      fqn <- FullyQualifiedEntityName.parse(request.fqn)
-      rev <- DocRevision.parse(request.rev)
-    } yield (fqn, rev)).flatMap(Future.fromTry) flatMap { res =>
-      val (fqn, rev) = res
-      if (!WarmUp.isWarmUpAction(fqn)) {
-        val key = fqn.toDocId.asDocInfo(rev)
-        QueuePool.get(MemoryQueueKey(request.invocationNamespace, key)) match {
-          case Some(queueValue) =>
-            implicit val transid = TransactionId.serdes.read(request.transactionId.parseJson)
-            if (!request.alive) logging.info(this, s"the container(${request.containerId}) is not alive")
+    request.targetBindingId match {
+      case Some(id) if id <= 0 =>
+        Future.successful(FetchResponse(ActivationResponse(Left(TargetBindingError.invalid(id))).serialize))
+      case _ =>
+        Future(for {
+          fqn <- FullyQualifiedEntityName.parse(request.fqn)
+          rev <- DocRevision.parse(request.rev)
+        } yield (fqn, rev)).flatMap(Future.fromTry) flatMap { res =>
+          val (fqn, rev) = res
+          if (!WarmUp.isWarmUpAction(fqn)) {
+            val key = fqn.toDocId.asDocInfo(rev)
+            QueuePool.get(MemoryQueueKey(request.invocationNamespace, key)) match {
+              case Some(queueValue) =>
+                implicit val transid = TransactionId.serdes.read(request.transactionId.parseJson)
+                if (!request.alive) logging.info(this, s"the container(${request.containerId}) is not alive")
 
-            (queueValue.queue ? GetActivation(
-              transid,
-              fqn,
-              request.containerId,
-              request.warmed,
-              request.lastDuration,
-              request.alive))
-              .mapTo[ActivationResponse]
-              .map { response =>
-                FetchResponse(response.serialize)
-              }
-              .recover {
-                case t: Throwable =>
-                  logging.error(
-                    this,
-                    s"Failed to get message from QueueManager container: ${request.containerId}, fqn: ${request.fqn}, rev: ${request.rev}, alive: ${request.alive}, lastDuration: ${request.lastDuration}, error: ${t.getMessage}")
-                  FetchResponse(ActivationResponse(Left(NoActivationMessage())).serialize)
-              }
-          case None =>
-            if (QueuePool.keys.exists { mkey =>
-                  mkey.invocationNamespace == request.invocationNamespace && mkey.docInfo.id == key.id
-                })
-              Future.successful(FetchResponse(ActivationResponse(Left(ActionMismatch())).serialize))
-            else
-              Future.successful(FetchResponse(ActivationResponse(Left(NoMemoryQueue())).serialize))
+                (queueValue.queue ? GetActivation(
+                  transid,
+                  fqn,
+                  request.containerId,
+                  request.warmed,
+                  request.lastDuration,
+                  request.alive,
+                  request.targetBindingId))
+                  .mapTo[ActivationResponse]
+                  .map { response =>
+                    FetchResponse(response.serialize)
+                  }
+                  .recover {
+                    case t: Throwable =>
+                      logging.error(
+                        this,
+                        s"Failed to get message from QueueManager container: ${request.containerId}, fqn: ${request.fqn}, rev: ${request.rev}, alive: ${request.alive}, lastDuration: ${request.lastDuration}, error: ${t.getMessage}")
+                      FetchResponse(ActivationResponse(Left(NoActivationMessage())).serialize)
+                  }
+              case None =>
+                if (QueuePool.keys.exists { mkey =>
+                      mkey.invocationNamespace == request.invocationNamespace && mkey.docInfo.id == key.id
+                    })
+                  Future.successful(FetchResponse(ActivationResponse(Left(ActionMismatch())).serialize))
+                else
+                  Future.successful(FetchResponse(ActivationResponse(Left(NoMemoryQueue())).serialize))
+            }
+          } else {
+            logging.info(
+              this,
+              s"The ${request.fqn} action is an action used to connect a network level connection. So response no activation")
+            Future.successful(FetchResponse(ActivationResponse(Left(NoActivationMessage())).serialize))
+          }
         }
-      } else {
-        logging.info(
-          this,
-          s"The ${request.fqn} action is an action used to connect a network level connection. So response no activation")
-        Future.successful(FetchResponse(ActivationResponse(Left(NoActivationMessage())).serialize))
-      }
     }
   }
 }
@@ -121,7 +127,8 @@ case class GetActivation(transactionId: TransactionId,
                          containerId: String,
                          warmed: Boolean,
                          lastDuration: Option[Long],
-                         alive: Boolean = true)
+                         alive: Boolean = true,
+                         targetBindingId: Option[Long] = None)
 case class ActivationResponse(message: Either[MemoryQueueError, ActivationMessage]) extends Message {
   override def serialize = ActivationResponse.serdes.write(this).compactPrint
 }

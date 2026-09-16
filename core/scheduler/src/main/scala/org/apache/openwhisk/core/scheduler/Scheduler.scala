@@ -80,6 +80,18 @@ class Scheduler(schedulerId: SchedulerInstanceId, schedulerEndpoints: SchedulerE
   private val activationStore =
     SpiLoader.get[ActivationStoreProvider].instance(actorSystem, logging)
 
+  private val targetBoundDispatchConfig =
+    loadConfigOrThrow[GatewayControlConfig](ConfigKeys.schedulerTargetBoundDispatch)
+  private val targetBoundActivationDispatcher: TargetBoundActivationDispatcher =
+    if (targetBoundDispatchConfig.enabled) {
+      val gatewayExecutionContext = actorSystem.dispatchers.lookup("dispatchers.gateway-control-dispatcher")
+      val gatewayClient = new P1GatewayControlClient(targetBoundDispatchConfig)(gatewayExecutionContext)
+      val codeProvider = WhiskActionExactRevisionProtectedCodeProvider(entityStore)(ec)
+      new GatewayTargetBoundActivationDispatcher(codeProvider, gatewayClient)(ec, logging)
+    } else {
+      TargetBoundActivationDispatcher.Unconfigured
+    }
+
   private val ack = {
     val sender = if (UserEvents.enabled) Some(new UserEventSender(producer)) else None
     new MessagingActiveAck(producer, schedulerId, sender)
@@ -217,7 +229,8 @@ class Scheduler(schedulerId: SchedulerInstanceId, schedulerEndpoints: SchedulerE
           schedulerId: SchedulerInstanceId,
           ack,
           store: (TransactionId, WhiskActivation, UserContext) => Future[Any],
-          getUserLimit: String => Future[Int]))
+          getUserLimit: String => Future[Int],
+          targetBoundActivationDispatcher))
     }
 
   val topic = s"${Scheduler.topicPrefix}scheduler${schedulerId.asString}"
